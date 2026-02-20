@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.19.xsd">
+
+    <include file="db/changelog/001-create-documents-table.xml"/>
+    <include file="db/changelog/002-create-indexes.xml"/>
+    <include file="db/changelog/003-create-approval-registry.xml"/>
+    <include file="db/changelog/004-create-document-history-table.xml"/>
+    <include file="db/changelog/005-add-document-number-sequence.xml"/>
+
+</databaseChangeLog>

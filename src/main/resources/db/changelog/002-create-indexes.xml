@@ -1,0 +1,35 @@
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <changeSet id="002-status-index" author="itq">
+        <createIndex indexName="idx_documents_status_updated_at"
+                     tableName="documents"
+                     unique="false">
+            <column name="status"/>
+            <column name="updated_at"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="002-title-index" author="itq">
+        <createIndex indexName="idx_documents_title"
+                     tableName="documents"
+                     unique="false">
+            <column name="title"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="002-status-created-index" author="itq">
+        <createIndex indexName="idx_documents_status_created_at"
+                     tableName="documents"
+                     unique="false">
+            <column name="status"/>
+            <column name="created_at"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="002-author-index" author="itq">
+        <createIndex indexName="idx_documents_author"
+                     tableName="documents"
+                     unique="false">
+            <column name="author"/>
+        </createIndex>
+    </changeSet>
+</databaseChangeLog>
