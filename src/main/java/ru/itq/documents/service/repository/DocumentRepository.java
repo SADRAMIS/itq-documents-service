@@ -16,10 +16,12 @@ public interface DocumentRepository extends JpaRepository<Document, Long>, JpaSp
 
     List<Document> findByStatusOrderByUpdatedAtAsc(Document.DocumentStatus status);
 
-    @Query("SELECT d.id FROM Document d WHERE d.status = :status ORDER BY d.updatedAt ASC LIMIT :limit")
+    @Query(value = "SELECT id FROM documents WHERE status = :status ORDER BY updated_at ASC LIMIT :limit", nativeQuery = true)
     List<Long> findIdsByStatusOrderByUpdatedAtAsc(
-            @Param("status") Document.DocumentStatus status,
+            @Param("status") String status,
             @Param("limit") int limit);
+
+    List<Document> findByIdInAndStatus(List<Long> ids, Document.DocumentStatus status);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(value = "UPDATE documents SET status = :newStatus, updated_at = CURRENT_TIMESTAMP, version = version + 1 " +

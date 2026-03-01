@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.transaction.TestTransaction;
 import org.springframework.transaction.annotation.Transactional;
 import ru.itq.documents.service.dto.*;
 import ru.itq.documents.service.entity.Document;
@@ -82,9 +83,11 @@ class DocumentServiceTest {
 
     @Test
     void testApproveBatch() {
-        // Сначала переводим в SUBMITTED
         Long docId = testDocument.getId();
         documentRepository.updateStatusOptimistic(docId, DRAFT.name(), SUBMITTED.name(), testDocument.getVersion());
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+        TestTransaction.start();
 
         BatchRequest request = new BatchRequest();
         request.setIds(List.of(docId));
@@ -110,20 +113,20 @@ class DocumentServiceTest {
 
     @Test
     void testApproveBatchWithPartialResults() {
-        // Создаем еще один документ
         CreateDocumentRequest request2 = new CreateDocumentRequest();
         request2.setAuthor("Author 2");
         request2.setTitle("Document 2");
         request2.setContent("Content 2");
         Document doc2 = documentService.create(request2, "test");
 
-        // Переводим оба в SUBMITTED
         Long docId1 = testDocument.getId();
         Long docId2 = doc2.getId();
         documentRepository.updateStatusOptimistic(docId1, DRAFT.name(), SUBMITTED.name(), testDocument.getVersion());
         documentRepository.updateStatusOptimistic(docId2, DRAFT.name(), SUBMITTED.name(), doc2.getVersion());
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+        TestTransaction.start();
 
-        // Утверждаем оба
         BatchRequest approveRequest = new BatchRequest();
         approveRequest.setIds(List.of(docId1, docId2));
         approveRequest.setInitiator("test-approver");
@@ -151,19 +154,20 @@ class DocumentServiceTest {
     void testApproveBatchConflict() {
         Long docId = testDocument.getId();
         documentRepository.updateStatusOptimistic(docId, DRAFT.name(), SUBMITTED.name(), testDocument.getVersion());
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+        TestTransaction.start();
 
         BatchRequest request = new BatchRequest();
         request.setIds(List.of(docId));
         request.setInitiator("test-user");
 
-        // Первое утверждение должно пройти
         List<BatchResult> results1 = documentService.approveBatch(request);
         assertTrue(results1.get(0).isSuccess());
 
-        // Второе утверждение должно вернуть конфликт
         List<BatchResult> results2 = documentService.approveBatch(request);
         assertFalse(results2.get(0).isSuccess());
-        assertEquals("NOT_FOUND", results2.get(0).getErrorCode()); // Документ уже в APPROVED
+        assertEquals("NOT_FOUND", results2.get(0).getErrorCode());
     }
 }
 

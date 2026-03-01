@@ -6,8 +6,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.domain.Specification;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import ru.itq.documents.service.dto.*;
 import ru.itq.documents.service.entity.ApprovalRegistry;
 import ru.itq.documents.service.entity.Document;
@@ -21,9 +23,11 @@ import ru.itq.documents.service.repository.DocumentRepository;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
-import ru.itq.documents.service.dto.ConcurrentApproveResult;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static ru.itq.documents.service.entity.Document.DocumentStatus.APPROVED;
 import static ru.itq.documents.service.entity.Document.DocumentStatus.DRAFT;
@@ -40,6 +44,8 @@ public class DocumentService {
     private final DocumentRepository repository;
     private final DocumentHistoryRepository historyRepository;
     private final ApprovalRegistryRepository approvalRegistryRepository;
+    @Qualifier("requiresNewTx")
+    private final TransactionTemplate requiresNewTx;
 
     @Value("${spring.datasource.url:jdbc:postgresql://localhost:5432/documents}")
     private String datasourceUrl;
@@ -60,23 +66,16 @@ public class DocumentService {
     }
 
     private String generateDocumentNumber() {
-        try {
-            // Используем последовательность из БД для генерации уникального номера
-            if (datasourceUrl.contains("h2") || datasourceUrl.contains("H2")) {
-                // Для H2 используем fallback
-                long timestamp = System.currentTimeMillis();
-                long counter = timestamp % 100000000;
-                return String.format("%s%08d", NUMBER_PREFIX, counter);
-            } else {
-                // Для PostgreSQL используем последовательность
-                Long sequenceValue = repository.getNextDocumentNumber();
-                return String.format("%s%08d", NUMBER_PREFIX, sequenceValue);
-            }
-        } catch (Exception e) {
-            // Fallback для любых ошибок
-            log.warn("Failed to get sequence value, using fallback: {}", e.getMessage());
+        if (datasourceUrl != null && (datasourceUrl.contains("h2") || datasourceUrl.contains("H2"))) {
             long timestamp = System.currentTimeMillis();
             return String.format("%s%08d", NUMBER_PREFIX, timestamp % 100000000);
+        }
+        try {
+            Long sequenceValue = repository.getNextDocumentNumber();
+            return String.format("%s%08d", NUMBER_PREFIX, sequenceValue);
+        } catch (Exception e) {
+            log.error("Failed to get document number from sequence", e);
+            throw new IllegalStateException("Cannot generate document number", e);
         }
     }
 
@@ -106,28 +105,37 @@ public class DocumentService {
     public List<BatchResult> approveBatch(BatchRequest request) {
         log.info("Processing approve batch for {} documents by {}", request.getIds().size(), request.getInitiator());
         List<BatchResult> results = new ArrayList<>();
+        String initiator = request.getInitiator();
+        String comment = request.getComment();
 
         for (Long id : request.getIds()) {
             try {
-                BatchResult result = approveSingle(id, request.getInitiator(), request.getComment());
+                BatchResult result = requiresNewTx.execute(status -> approveSingleInTx(id, initiator, comment));
                 results.add(result);
-            } catch (Exception e) {
-                log.error("Error approving document {}: {}", id, e.getMessage());
+            } catch (RegistryErrorException e) {
+                log.warn("Registry error for document {}: {}", id, e.getMessage());
                 results.add(BatchResult.builder()
                         .id(id)
                         .success(false)
-                        .errorCode("ERROR")
+                        .errorCode("REGISTRY_ERROR")
                         .message(e.getMessage())
                         .build());
+            } catch (Exception e) {
+                log.error("Unexpected error approving document {}: {}", id, e.getMessage(), e);
+                throw e;
             }
         }
 
         return results;
     }
 
-    private BatchResult approveSingle(Long id, String initiator, String comment) {
+    /**
+     * Выполняется в отдельной транзакции (REQUIRES_NEW).
+     * При ошибке записи в реестр вся транзакция откатывается автоматически.
+     */
+    private BatchResult approveSingleInTx(Long id, String initiator, String comment) {
         Optional<Document> docOpt = repository.findByIdAndStatus(id, SUBMITTED);
-        
+
         if (docOpt.isEmpty()) {
             return BatchResult.builder()
                     .id(id)
@@ -138,9 +146,8 @@ public class DocumentService {
         }
 
         Document doc = docOpt.get();
-        int currentVersion = doc.getVersion();
-        int updated = repository.updateStatusOptimistic(id, SUBMITTED.name(), APPROVED.name(), currentVersion);
-        
+        int updated = repository.updateStatusOptimistic(id, SUBMITTED.name(), APPROVED.name(), doc.getVersion());
+
         if (updated == 0) {
             return BatchResult.builder()
                     .id(id)
@@ -149,78 +156,56 @@ public class DocumentService {
                     .message("Concurrent modification detected")
                     .build();
         }
-        
-        // Сохраняем историю
-        saveHistory(id, ActionTypeDto.APPROVE, initiator, comment);
 
-        // Пытаемся записать в реестр
+        saveHistory(doc, ActionTypeDto.APPROVE, initiator, comment);
         try {
-            ApprovalRegistry registry = ApprovalRegistry.builder()
-                    .documentId(id)
-                    .approverId(initiator)
-                    .build();
-            approvalRegistryRepository.save(registry);
-            log.info("Successfully approved document {} by {}", id, initiator);
-            return BatchResult.builder()
-                    .id(id)
-                    .success(true)
-                    .build();
+            approvalRegistryRepository.save(
+                    ApprovalRegistry.builder().documentId(id).approverId(initiator).build()
+            );
         } catch (Exception e) {
             log.error("Failed to save approval registry for document {}: {}", id, e.getMessage());
-            // Откатываем изменение статуса (версия уже увеличилась на 1)
-            repository.updateStatusOptimistic(id, APPROVED.name(), SUBMITTED.name(), currentVersion + 1);
-            throw new RegistryErrorException("Failed to save approval registry: " + e.getMessage());
+            throw new RegistryErrorException("Failed to save approval registry: " + e.getMessage(), e);
         }
+        log.info("Successfully approved document {} by {}", id, initiator);
+        return BatchResult.builder().id(id).success(true).build();
     }
 
-    private List<BatchResult> processBatch(List<Long> ids, Document.DocumentStatus fromStatus, 
+    private List<BatchResult> processBatch(List<Long> ids, Document.DocumentStatus fromStatus,
                                            Document.DocumentStatus toStatus, ActionTypeDto actionType,
                                            String initiator, String comment) {
         List<BatchResult> results = new ArrayList<>();
+        if (ids.isEmpty()) {
+            return results;
+        }
+
+        List<Document> docs = repository.findByIdInAndStatus(ids, fromStatus);
+        Map<Long, Document> docById = docs.stream().collect(Collectors.toMap(Document::getId, Function.identity()));
 
         for (Long id : ids) {
-            Optional<Document> docOpt = repository.findByIdAndStatus(id, fromStatus);
-            
-            if (docOpt.isEmpty()) {
-                results.add(BatchResult.builder()
-                        .id(id)
-                        .success(false)
-                        .errorCode("NOT_FOUND")
-                        .message("Document not found or not in " + fromStatus + " status")
-                        .build());
+            Document doc = docById.get(id);
+            if (doc == null) {
+                results.add(batchError(id, "NOT_FOUND", "Document not found or not in " + fromStatus + " status"));
                 continue;
             }
 
-            Document doc = docOpt.get();
-            int currentVersion = doc.getVersion();
-            int updated = repository.updateStatusOptimistic(id, fromStatus.name(), toStatus.name(), currentVersion);
-            
+            int updated = repository.updateStatusOptimistic(id, fromStatus.name(), toStatus.name(), doc.getVersion());
             if (updated == 0) {
-                results.add(BatchResult.builder()
-                        .id(id)
-                        .success(false)
-                        .errorCode("CONFLICT")
-                        .message("Concurrent modification detected")
-                        .build());
+                results.add(batchError(id, "CONFLICT", "Concurrent modification detected"));
                 continue;
             }
 
-            // Сохраняем историю
-            saveHistory(id, actionType, initiator, comment);
-
-            results.add(BatchResult.builder()
-                    .id(id)
-                    .success(true)
-                    .build());
+            saveHistory(doc, actionType, initiator, comment);
+            results.add(BatchResult.builder().id(id).success(true).build());
         }
 
         return results;
     }
 
-    private void saveHistory(Long documentId, ActionTypeDto action, String initiator, String comment) {
-        Document document = repository.findById(documentId)
-                .orElseThrow(() -> new NotFoundException("Document not found: " + documentId));
-        
+    private static BatchResult batchError(Long id, String code, String message) {
+        return BatchResult.builder().id(id).success(false).errorCode(code).message(message).build();
+    }
+
+    private void saveHistory(Document document, ActionTypeDto action, String initiator, String comment) {
         DocumentHistory history = new DocumentHistory();
         history.setDocument(document);
         history.setAction(action);
